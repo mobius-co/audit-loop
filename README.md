@@ -1,8 +1,8 @@
 # audit-loop
 
-Automated review loop built around [Kiro](https://kiro.dev). An external auditor critiques, Kiro addresses findings by editing code directly. Loops until approved.
+Automated cross-agent review loop. Codex critiques, Claude addresses findings by editing code directly. Loops until approved.
 
-Kiro is the agent that does the real work — reading files, making changes, and deciding what to fix or reject. The auditor (Claude or Codex) just reviews and provides feedback.
+Claude is the driver — reading files, making changes, and deciding what to fix or reject. Codex is the adversary — it only reviews and critiques, with no file access.
 
 Works on code diffs (default) or any file content — design docs, specs, proposals, whatever you point it at.
 
@@ -24,8 +24,8 @@ By default installs to `~/.local/bin/`. Override with `make install PREFIX=/usr/
 
 ## Requirements
 
-- `kiro-cli` (the agent that addresses findings — with agents configured)
-- `claude` CLI or `codex` CLI (the auditor — reviews and critiques)
+- `claude` CLI (the driver — addresses findings by editing code)
+- `codex` CLI (the adversary — reviews and critiques, no file access)
 - `git` (only in diff mode)
 
 ## Usage
@@ -44,7 +44,7 @@ audit-loop --base develop
 audit-loop --input docs/architecture.md --theme doc-review
 
 # More rounds
-audit-loop --max-rounds 5
+audit-loop --max-rounds 8
 
 # Use a custom theme
 audit-loop --theme security
@@ -52,6 +52,9 @@ audit-loop --theme ./my-theme/
 
 # Preview without running
 audit-loop --dry-run
+
+# Swap roles — codex drives (edits code), claude critiques (read-only)
+audit-loop --swap
 ```
 
 ## Discuss Mode
@@ -77,10 +80,10 @@ audit-loop discuss --context "main.go,prompts/" "Should prompts be runtime-confi
 ## How it works
 
 1. Captures content (git diff by default, or `--input` file)
-2. Sends content to auditor (Claude/Codex) for critique
-3. If auditor says NEEDS_CHANGES → sends findings to Kiro
-4. Kiro fixes what it agrees with, rejects what it doesn't (with reasoning)
-5. Content re-captured and sent back to auditor (with Kiro's prior response)
+2. Sends content to Codex for critique
+3. If Codex says NEEDS_CHANGES → sends findings to Claude
+4. Claude fixes what it agrees with, rejects what it doesn't (with reasoning)
+5. Content re-captured and sent back to Codex (with Claude's prior response)
 6. Repeats until APPROVED or max rounds exhausted
 
 No commits are made during the loop. Changes stay unstaged. You decide what to keep.
@@ -89,7 +92,7 @@ No commits are made during the loop. Changes stay unstaged. You decide what to k
 
 ### Diff mode (default)
 
-Reviews your branch changes. Requires a git repo. Re-captures the diff each round (since Kiro may modify files).
+Reviews your branch changes. Requires a git repo. Re-captures the diff each round (since Claude may modify files).
 
 ```bash
 audit-loop                     # diff against main
@@ -98,7 +101,7 @@ audit-loop --base develop      # diff against develop
 
 ### File mode (`--input`)
 
-Reviews any file's contents. No git required. Re-reads the file each round (in case Kiro edits it).
+Reviews any file's contents. No git required. Re-reads the file each round (in case Claude edits it).
 
 ```bash
 audit-loop --input docs/design.md --theme doc-review
@@ -111,8 +114,8 @@ A theme is a directory with two files:
 
 ```
 my-theme/
-├── auditor.md      # prompt for the critic (Claude)
-└── addresser.md    # prompt for the fixer (Kiro)
+├── auditor.md      # prompt for the critic role (codex by default, claude with --swap)
+└── addresser.md    # prompt for the driver role (claude by default, codex with --swap)
 ```
 
 That's it. No config files, no special format.
@@ -230,23 +233,41 @@ The auditor prompt **must** produce output where the first matching line is eith
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--max-rounds N` | 3 | Max review iterations |
+| `--max-rounds N` | 5 | Max review iterations |
 | `--base BRANCH` | main | Base branch to diff against |
 | `--input PATH` | — | File to review (uses file mode instead of diff mode) |
 | `--theme NAME` | — | Theme name or path (dir with auditor.md + addresser.md) |
-| `--auditor NAME` | claude | Auditor CLI: `claude` or `codex` |
-| `--model MODEL` | claude-sonnet-4-6 | Claude model for auditing |
+| `--model MODEL` | claude-sonnet-4-6 | Claude model to use, whichever role claude fills |
 | `--timeout SECS` | 300 | Timeout per agent call |
-| `--agent NAME` | — | Kiro agent for addressing |
 | `--log-dir PATH` | .audit/reviews | Log output directory |
 | `--dry-run` | — | Preview without running |
 | `--full` | — | Review entire repo, not just branch diff |
 | `--context PATHS` | — | Comma-separated files/dirs for discuss context |
+| `--swap` | false | Swap roles: codex drives (edits code), claude critiques (read-only) |
+
+## Swapping roles
+
+By default Claude drives (edits code) and Codex critiques. `--swap` inverts this: Codex gets a writable sandbox and edits code, Claude drops to read-only tools and critiques. Useful for comparing how each model performs in either role, or if one CLI is temporarily unavailable/rate-limited in its default role.
+
+This also inverts `discuss` mode: normally Claude is the grounded debater (reads the repo) and Codex is blind (text/context only); `--swap` flips which identity gets which prompt and tool access.
 
 ## Security
 
-Claude runs in print mode (`-p`) with no tools — it only sees the diff text and returns a review. Kiro runs non-interactively with a limited tool set: `read`, `write`, `grep`, `glob`, `code`. No explicit shell or network tools are granted. Neither agent can make external requests.
+The critic runs read-only; the driver gets write access. Which binary fills which role depends on `--swap`.
+
+- **Claude as critic**: `claude -p` with `--allowedTools Read,Grep,Glob` — no write, no shell, no network. This is real tool-level isolation: the tools Claude can call are restricted, so it has no path to files outside the allowlist.
+- **Claude as driver**: `claude -p` with `--allowedTools Read,Write,Edit,Grep,Glob` — no shell, no network.
+- **Codex as critic**: `codex exec --sandbox read-only` — cannot write files or reach the network.
+- **Codex as driver**: `codex exec --sandbox workspace-write` — can write within the project workspace, no network.
+
+### Known limitation: Codex's sandbox doesn't scope reads
+
+`--sandbox` in Codex CLI restricts *writes* and *network* — it does not restrict *what Codex can read*. Wherever Codex runs (critic, driver, or either side of `discuss` mode), it can read any file your OS user account can read: not just this repo, but your home directory, SSH keys, cloud credentials, shell history, other projects — everything. A prompt-injected diff (or a malicious `discuss` question) can instruct Codex to read such a file and quote it back in its findings, which then lands in your terminal and in `.audit/reviews/*.md`. No network access is needed for that leak — the exfiltration channel is the review output itself.
+
+The tool takes one small, partial precaution: when Codex runs as critic, it's started from an empty temp directory (`main.go`, `criticDir`) instead of the repo root. This blocks trivial relative-path reads (`cat ./secrets`) but does **not** block absolute-path reads or filesystem traversal — it is not real isolation, and the tool prints a warning to this effect at startup whenever Codex is involved (which is every run).
+
+Real isolation would mean running Codex inside a container or OS-level sandbox (Docker/Podman, or a custom `sandbox-exec`/bubblewrap profile) with nothing mounted but the prompt text. This isn't implemented because it requires Docker (or a platform-specific sandboxing tool) to be installed and running, which is a heavier requirement than this tool currently asks for. If you run audit-loop against diffs or `discuss` questions from untrusted sources, treat this as a live limitation, not a solved problem.
 
 ## Environment variables
 
-All flags have env var equivalents: `AUDIT_MAX_ROUNDS`, `AUDIT_BASE`, `AUDIT_INPUT`, `AUDIT_TIMEOUT`, `AUDIT_AGENT`, `AUDIT_THEME`, `AUDIT_AUDITOR`, `AUDIT_MODEL`, `AUDIT_LOG_DIR`.
+All flags have env var equivalents: `AUDIT_MAX_ROUNDS`, `AUDIT_BASE`, `AUDIT_INPUT`, `AUDIT_TIMEOUT`, `AUDIT_THEME`, `AUDIT_MODEL`, `AUDIT_LOG_DIR`, `AUDIT_SWAP`.

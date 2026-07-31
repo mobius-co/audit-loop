@@ -1,39 +1,40 @@
 # audit-loop
 
-Automated cross-agent code review loop. Kiro implements, Claude audits, Kiro addresses. Repeats until approved.
+Automated cross-agent code review loop. Codex audits, Claude addresses. Repeats until approved.
 
 ## Usage
 
 ```bash
 audit-loop                     # review current branch vs main
 audit-loop --base develop      # review against different base
-audit-loop --max-rounds 5      # override default 3 rounds
+audit-loop --max-rounds 8      # override default 5 rounds
 audit-loop --dry-run           # show what would be reviewed, don't run
+audit-loop --swap              # codex drives (edits code), claude critiques
 ```
 
 ## Requirements
 
-- `claude` CLI (Claude Code with `-p` support)
-- `kiro-cli` (with `reviewer` and `mobius` agents configured)
+- `codex` CLI (adversary — supports `codex exec` with `--sandbox read-only`)
+- `claude` CLI (Claude Code with `-p` support and tool-permission flags)
 - `git`
 
 ## Flow
 
 1. Capture diff: `git diff <base>..HEAD` combined with `git diff` (unstaged) — full picture of branch state
-2. Send diff to Claude (`claude -p`) with adversarial reviewer prompt + prior round context (if any)
+2. Send diff to Codex (`codex exec --sandbox read-only -`) with adversarial reviewer prompt + prior round context (if any)
 3. Parse response: scan for first line matching `^(APPROVED|NEEDS_CHANGES)` (skip preamble)
 4. If APPROVED → write log, exit 0
-5. If NEEDS_CHANGES → pass findings to Kiro (`kiro-cli --no-interactive --agent mobius`)
-6. Kiro reads findings, fixes code, outputs what it did and why (including rejections with reasoning)
+5. If NEEDS_CHANGES → pass findings to Claude (`claude -p --permission-mode acceptEdits --allowedTools Read,Write,Edit,Grep,Glob`)
+6. Claude reads findings, fixes code, outputs what it did and why (including rejections with reasoning)
 7. Capture new combined diff (`git diff <base>..HEAD` + `git diff` unstaged)
-8. Loop back to step 2 — Claude receives the new diff AND Kiro's prior response table (so it can see rejections and decide whether to accept or escalate)
+8. Loop back to step 2 — Codex receives the new diff AND Claude's prior response table (so it can see rejections and decide whether to accept or escalate)
 9. If max rounds hit → write log, exit 1
 
 ### Rejection handling
 
-When Kiro rejects a finding, the next round's Claude prompt includes Kiro's reasoning. Claude can:
+When Claude rejects a finding, the next round's Codex prompt includes Claude's reasoning. Codex can:
 - **Accept** the rejection (stop flagging it)
-- **Escalate** with stronger justification (Kiro sees the escalation next round)
+- **Escalate** with stronger justification (Claude sees the escalation next round)
 
 If they disagree for the remaining rounds, the loop exits at max rounds and the log captures the unresolved disagreement. This is not a bug — it's a signal for human review.
 
@@ -47,16 +48,22 @@ If they disagree for the remaining rounds, the loop exits at max rounds and the 
 
 ## Agents
 
-### Auditor (Claude)
-- Invoked via: `claude -p "<prompt>"` (uses user's default Claude Code model)
+Roles are fixed per run but which binary fills which is controlled by `--swap` (default: codex critiques, claude drives).
+
+Caveat: `--sandbox` restricts codex's writes and network, not what it can *read* — wherever codex runs it can read anything the OS user account can read, not just this repo. See README's Security section ("Known limitation: Codex's sandbox doesn't scope reads") for the full explanation and the partial mitigation in place.
+
+### Critic role (codex by default, claude with `--swap`)
+- Codex invoked via: `codex exec --sandbox read-only -` (prompt piped over stdin) — cannot write files or reach the network
+- Claude invoked via: `claude -p --model <model> --allowedTools Read,Grep,Glob` — read-only, no shell, no network
 - Persona: Adversarial code reviewer
-- Receives: diff + prior round's Kiro response (if any)
+- Receives: diff + prior round's driver response (if any)
 - Output: Strict format — APPROVED/NEEDS_CHANGES + structured findings
 - Timeout: 5 min
 
-### Addresser (Kiro)
-- Invoked via: `kiro-cli chat --no-interactive --trust-tools=read,write,grep,glob,code "<prompt>"`
-- Persona: Mobius (needs write, code, etc. to fix code)
+### Driver role (claude by default, codex with `--swap`)
+- Claude invoked via: `claude -p --model <model> --permission-mode acceptEdits --allowedTools Read,Write,Edit,Grep,Glob "<prompt>"`
+- Codex invoked via: `codex exec --sandbox workspace-write -` — can write within the project workspace, no network
+- Persona: Driver — needs read/write/edit to fix code
 - Output: What it fixed, what it rejected, reasoning for each
 - Timeout: 5 min
 
@@ -79,7 +86,7 @@ One file per run: `.audit/reviews/YYYYMMDD-HHMMSS.md`
 
 ## Round N
 
-### Audit (Claude)
+### Audit (Codex)
 **Verdict**: NEEDS_CHANGES
 **Findings**: <count by severity>
 
@@ -88,7 +95,7 @@ One file per run: `.audit/reviews/YYYYMMDD-HHMMSS.md`
 - **Problem**: description
 - **Fix**: suggestion
 
-### Response (Kiro)
+### Response (Claude)
 | # | Finding | Decision | Reasoning |
 |---|---------|----------|-----------|
 | 1 | ... | ✅ Fixed / ❌ Rejected | ... |
@@ -105,12 +112,12 @@ Defaults (overridable via flags or env vars):
 
 | Setting | Default | Flag | Env |
 |---------|---------|------|-----|
-| Max rounds | 3 | `--max-rounds` | `AUDIT_MAX_ROUNDS` |
+| Max rounds | 5 | `--max-rounds` | `AUDIT_MAX_ROUNDS` |
 | Base branch | main | `--base` | `AUDIT_BASE` |
 | Theme | (embedded) | `--theme` | `AUDIT_THEME` |
 | Log dir | .audit/reviews | `--log-dir` | `AUDIT_LOG_DIR` |
 | Timeout (per agent) | 300s | `--timeout` | `AUDIT_TIMEOUT` |
-| Kiro agent | — | `--agent` | `AUDIT_AGENT` |
+| Swap roles | false | `--swap` | `AUDIT_SWAP` |
 
 ## File Structure
 
@@ -118,8 +125,8 @@ Defaults (overridable via flags or env vars):
 audit-loop/
 ├── audit-loop           # main script (bash)
 ├── prompts/
-│   ├── auditor.md       # claude's review prompt template
-│   └── addresser.md     # kiro's fix prompt template
+│   ├── auditor.md       # critic role's review prompt template
+│   └── addresser.md     # driver role's fix prompt template
 ├── lib/
 │   ├── parse.sh         # parse APPROVED/NEEDS_CHANGES from output
 │   └── log.sh           # markdown log writer
@@ -199,20 +206,22 @@ This makes rubber-stamping structurally difficult.
 
 ### Context Parity
 
-Claude runs in print mode (`-p`) — no tool access. Kiro has `read`, `grep`, `glob`, `code`. This asymmetry means Kiro can ground claims in actual code while Claude can only reason from what's in the prompt.
+By default Claude is grounded (`--allowedTools Read,Grep,Glob`) and Codex is blind (`codex exec --sandbox read-only`, given no instruction to explore). Claude's blind variant is plain `claude -p` with no `--allowedTools` at all — no tools granted. `--swap` inverts which identity is grounded vs blind, and swaps which prompt template (`discuss-grounded.md` / `discuss-blind.md`) each receives. Codex itself always runs the same `--sandbox read-only` invocation in both roles, since codex has no zero-tool mode — its "blindness" comes from the prompt not telling it to explore, not from a capability restriction.
 
-Fix: `--context` files are read and inlined into both agents' prompts. Both see the same code. Kiro *can* look at additional files if it wants to, but Claude always has at minimum what `--context` provides.
+This asymmetry means the grounded debater can ground claims in actual code while the blind debater can only reason from what's in the prompt.
+
+Fix: `--context` files are read and inlined into both agents' prompts. Both see the same code. The grounded debater *can* look at additional files if it wants to, but the blind debater always has at minimum what `--context` provides.
 
 ### Flow
 
 1. User provides a question + optional `--context` files
 2. **Round 1 (blind):**
    - Claude receives question + context → states position
-   - Kiro receives question + context → states position independently
+   - Codex receives question + context → states position independently
    - Neither sees the other
 3. **Round 2+:**
-   - Claude receives Kiro's prior position → steelmans it, then responds
-   - Kiro receives Claude's prior position → steelmans it, then responds
+   - Claude receives Codex's prior position → steelmans it, then responds
+   - Codex receives Claude's prior position → steelmans it, then responds
 4. Repeat until `CONSENSUS` or max rounds hit
 
 ### Exit Conditions
@@ -250,8 +259,9 @@ if len(os.Args) > 1 && os.Args[1] == "discuss" {
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--context PATH` | — | Comma-separated file/dir paths to inline as context |
-| `--max-rounds N` | 3 | Max deliberation rounds |
+| `--max-rounds N` | 5 | Max deliberation rounds |
 | `--question` | — | Alternative to positional arg for the question |
+| `--swap` | false | Invert which identity is grounded vs blind |
 
 ### Log
 
@@ -271,7 +281,7 @@ Same directory (`.audit/reviews/`), filename prefixed with `discuss-`:
 ### Claude
 <position>
 
-### Kiro
+### Codex
 <position>
 
 ## Round 2
@@ -281,7 +291,7 @@ Same directory (`.audit/reviews/`), filename prefixed with `discuss-`:
 **Steelman**: <opposing view>
 **Position**: <own view>
 
-### Kiro
+### Codex
 **Verdict**: CONSENSUS
 **Steelman**: <opposing view>
 **Position**: <own view>
@@ -292,8 +302,7 @@ Same directory (`.audit/reviews/`), filename prefixed with `discuss-`:
 
 ## Future Considerations
 
-- Support swapping auditor (use kiro `reviewer` agent instead of claude, or gemini via API)
-- Support multiple auditors in parallel (claude + gemini, deduplicate findings)
+- Support multiple adversaries in parallel (codex + gemini, deduplicate findings)
 - Integration with CI (run on PR open)
 - Configurable severity threshold (only loop on critical/high, accept medium/low)
 - Discuss mode: support passing stdin or clipboard content as context

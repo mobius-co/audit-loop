@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,18 +19,17 @@ import (
 var prompts embed.FS
 
 var (
-	maxRounds = flag.Int("max-rounds", 3, "Max review rounds")
+	maxRounds = flag.Int("max-rounds", 5, "Max review rounds")
 	base      = flag.String("base", "main", "Base branch to diff against")
 	input     = flag.String("input", "", "File to review (uses file mode instead of diff mode)")
-	model     = flag.String("model", "claude-sonnet-4-6", "Claude model for auditing")
-	auditor   = flag.String("auditor", "claude", "Auditor CLI: claude or codex")
+	model     = flag.String("model", "claude-sonnet-4-6", "Claude model for the driver (addresser) role")
 	timeout   = flag.Duration("timeout", 5*time.Minute, "Timeout per agent invocation")
-	agent     = flag.String("agent", "", "Kiro agent for addressing findings")
 	logDir    = flag.String("log-dir", ".audit/reviews", "Directory for review logs")
 	theme     = flag.String("theme", "", "Theme name or path (directory with auditor.md + addresser.md)")
 	dryRun    = flag.Bool("dry-run", false, "Show what would be reviewed, don't run")
 	full      = flag.Bool("full", false, "Review entire repo, not just branch diff")
 	ctxPaths  = flag.String("context", "", "Comma-separated file/dir paths for discuss context")
+	swap      = flag.Bool("swap", false, "Swap roles: codex drives (edits code), claude critiques (read-only)")
 )
 
 func main() {
@@ -52,10 +52,6 @@ func main() {
 		fatal("timeout must be positive, got %s", *timeout)
 	}
 
-	if *auditor != "claude" && *auditor != "codex" {
-		fatal("unsupported auditor %q: must be claude or codex", *auditor)
-	}
-
 	paths := flag.Args() // positional args are path filters
 
 	fileMode := *input != ""
@@ -65,11 +61,9 @@ func main() {
 			fatal(err.Error())
 		}
 	} else {
-		// In file mode, just check the auditor and kiro are available
-		for _, cmd := range []string{*auditor, "kiro-cli"} {
-			if _, err := exec.LookPath(cmd); err != nil {
-				fatal("%s not found in PATH", cmd)
-			}
+		// In file mode, just check codex and claude are available
+		if err := preflightTools(); err != nil {
+			fatal(err.Error())
 		}
 		if _, err := os.Stat(*input); err != nil {
 			fatal("input file not found: %v", err)
@@ -107,8 +101,11 @@ func main() {
 		if *theme != "" {
 			info("  Theme: %s", *theme)
 		}
+		info("  Critic: %s / Driver: %s", criticName(), driverName())
 		os.Exit(0)
 	}
+
+	warnCodexSandboxScope()
 
 	themeDir := resolveThemeDir()
 	if themeDir != "" {
@@ -128,12 +125,12 @@ func main() {
 
 	for round < *maxRounds {
 		round++
-		info("Round %d/%d — sending content to %s...", round, *maxRounds, *auditor)
+		info("Round %d/%d — sending content to %s...", round, *maxRounds, criticName())
 
 		content, err = captureContent(fileMode, paths)
 		if err != nil {
 			errorf("content capture failed (round %d): %v", round, err)
-			log.writeRoundAudit(round, "ERROR", err.Error())
+			log.writeRoundAudit(round, criticName(), "ERROR", err.Error())
 			verdict = "ERROR"
 			break
 		}
@@ -144,15 +141,33 @@ func main() {
 		}
 		auditPrompt := buildAuditorPrompt(themeDir, content, priorResponse, branch, round)
 
-		auditorBin, auditorCmdArgs, stdinData := auditorArgs(auditPrompt)
-		auditOutput, err := runAgent(auditorBin, auditorCmdArgs, stdinData, *timeout)
+		criticBin, criticCmdArgs, stdinData := criticArgs(auditPrompt)
+		criticDir := ""
+		if criticName() == "codex" {
+			// Starting codex outside the repo blocks trivial relative-path
+			// reads (`cat ./secrets`) from a prompt-injected diff. It is NOT
+			// real isolation: --sandbox read-only restricts writes/network,
+			// not read scope, so absolute-path reads still reach anything
+			// the OS user account can read. See README's Security section.
+			td, tdErr := os.MkdirTemp("", "audit-critic-*")
+			if tdErr != nil {
+				errorf("could not create temp dir for codex critic (round %d): %v", round, tdErr)
+				verdict = "ERROR"
+				break
+			}
+			criticDir = td
+		}
+		auditOutput, err := runAgent(criticBin, criticCmdArgs, stdinData, criticDir, *timeout)
+		if criticDir != "" {
+			os.RemoveAll(criticDir)
+		}
 		if err != nil {
-			errorf("%s failed (round %d): %v", *auditor, round, err)
+			errorf("%s failed (round %d): %v", criticName(), round, err)
 			detail := err.Error()
 			if auditOutput != "" {
 				detail = auditOutput + "\n\n" + detail
 			}
-			log.writeRoundAudit(round, "ERROR", detail)
+			log.writeRoundAudit(round, criticName(), "ERROR", detail)
 			verdict = "ERROR"
 			break
 		}
@@ -160,45 +175,37 @@ func main() {
 		verdict = parseVerdict(auditOutput)
 		findings := parseFindings(auditOutput)
 
-		info("%s verdict: %s", *auditor, verdict)
-		log.writeRoundAudit(round, verdict, findings)
+		info("%s verdict: %s", criticName(), verdict)
+		log.writeRoundAudit(round, criticName(), verdict, findings)
 
 		if verdict == "APPROVED" {
 			break
 		}
 		if verdict == "UNKNOWN" {
-			errorf("Could not parse verdict from Claude's response")
+			errorf("Could not parse verdict from %s's response", criticName())
 			break
 		}
 
-		info("Sending findings to Kiro for resolution...")
+		info("Sending findings to %s for resolution...", driverName())
 		addresserPrompt := buildAddresserPrompt(themeDir, findings, branch, round)
 
-		kiroArgs := []string{
-			"chat", "--no-interactive",
-			"--trust-tools=read,write,grep,glob,code",
-		}
-		if *agent != "" {
-			kiroArgs = append(kiroArgs, "--agent", *agent)
-		} else {
-			info("No --agent specified; using kiro-cli default agent")
-		}
-		kiroOutput, err := runAgent("kiro-cli", kiroArgs, addresserPrompt, *timeout)
+		driverBin, driverCmdArgs, driverStdin := driverArgs(addresserPrompt)
+		driverOutput, err := runAgent(driverBin, driverCmdArgs, driverStdin, "", *timeout)
 		if err != nil {
 			detail := err.Error()
-			if kiroOutput != "" {
-				detail = kiroOutput + "\n\n" + detail
+			if driverOutput != "" {
+				detail = driverOutput + "\n\n" + detail
 			}
-			errorf("Kiro failed (round %d): %v", round, detail)
-			log.writeRoundResponse("Agent failed: " + detail)
+			errorf("%s failed (round %d): %v", driverName(), round, detail)
+			log.writeRoundResponse(driverName(), "Agent failed: "+detail)
 			break
 		}
 
-		responseTable := parseResponseTable(kiroOutput)
+		responseTable := parseResponseTable(driverOutput)
 		priorResponse = responseTable
 
-		info("Kiro addressed findings")
-		log.writeRoundResponse(responseTable)
+		info("%s addressed findings", driverName())
+		log.writeRoundResponse(driverName(), responseTable)
 	}
 
 	elapsed := time.Since(start)
@@ -239,84 +246,95 @@ func runDiscuss() {
 	fileContext := loadContext(*ctxPaths)
 
 	if *dryRun {
+		grounded, blind := "claude", "codex"
+		if *swap {
+			grounded, blind = "codex", "claude"
+		}
 		info("Dry run — would discuss:")
 		info("  Question: %s", question)
 		info("  Context: %s", *ctxPaths)
 		info("  Max rounds: %d", *maxRounds)
+		info("  Grounded: %s / Blind: %s", grounded, blind)
 		os.Exit(0)
 	}
+
+	warnCodexSandboxScope()
 
 	dlog := newDiscussLog(*logDir, question, *ctxPaths, *maxRounds)
 	start := time.Now()
 
-	var claudePosition, kiroPosition string
+	var claudePosition, codexPosition string
 	var verdict string
+
+	// One debater is grounded (read-only repo access), the other blind
+	// (text-only). Default: claude grounded, codex blind. --swap inverts
+	// which identity gets which prompt/tool access; codex has no true
+	// zero-tool mode, so its args stay a read-only sandbox either way.
+	claudeTemplate, codexTemplate := "discuss-grounded.md", "discuss-blind.md"
+	claudeDiscussArgs := []string{"-p", "--model", *model, "--allowedTools", "Read,Grep,Glob"}
+	if *swap {
+		claudeTemplate, codexTemplate = "discuss-blind.md", "discuss-grounded.md"
+		claudeDiscussArgs = []string{"-p", "--model", *model}
+	}
+	codexDiscussArgs := []string{"exec", "--sandbox", "read-only", "-"}
 
 	for round := 1; round <= *maxRounds; round++ {
 		if round == 1 {
 			// Blind first round — both agents respond independently
 			info("Round 1/%d — blind positions...", *maxRounds)
 
-			claudePrompt := buildDiscussPrompt("discuss-claude.md", question, fileContext, "", true)
-			kiroPrompt := buildDiscussPrompt("discuss-kiro.md", question, fileContext, "", true)
+			claudePrompt := buildDiscussPrompt(claudeTemplate, question, fileContext, "", true)
+			codexPrompt := buildDiscussPrompt(codexTemplate, question, fileContext, "", true)
 
-			var claudeErr, kiroErr error
-			claudePosition, claudeErr = runAgent("claude", []string{"-p", "--model", *model}, claudePrompt, *timeout)
+			var claudeErr, codexErr error
+			claudePosition, claudeErr = runAgent("claude", claudeDiscussArgs, claudePrompt, "", *timeout)
 			if claudeErr != nil {
 				errorf("Claude failed: %v", claudeErr)
 				verdict = "ERROR"
 				break
 			}
 
-			kiroArgs := []string{"chat", "--no-interactive", "--trust-tools=read,grep,glob,code"}
-			if *agent != "" {
-				kiroArgs = append(kiroArgs, "--agent", *agent)
-			}
-			kiroPosition, kiroErr = runAgent("kiro-cli", kiroArgs, kiroPrompt, *timeout)
-			if kiroErr != nil {
-				errorf("Kiro failed: %v", kiroErr)
+			codexPosition, codexErr = runAgent("codex", codexDiscussArgs, codexPrompt, "", *timeout)
+			if codexErr != nil {
+				errorf("Codex failed: %v", codexErr)
 				verdict = "ERROR"
 				break
 			}
 
-			dlog.writeRound(round, claudePosition, kiroPosition)
+			dlog.writeRound(round, claudePosition, codexPosition)
 			info("  Claude: %s", parseDiscussVerdict(claudePosition))
-			info("  Kiro: %s", parseDiscussVerdict(kiroPosition))
+			info("  Codex: %s", parseDiscussVerdict(codexPosition))
 		} else {
 			// Debate rounds — each sees the other's prior position
 			info("Round %d/%d — debate...", round, *maxRounds)
 
-			claudePrompt := buildDiscussPrompt("discuss-claude.md", question, fileContext, kiroPosition, false)
+			claudePrompt := buildDiscussPrompt(claudeTemplate, question, fileContext, codexPosition, false)
 			prevClaudePosition := claudePosition
 			var claudeErr error
-			claudePosition, claudeErr = runAgent("claude", []string{"-p", "--model", *model}, claudePrompt, *timeout)
+			claudePosition, claudeErr = runAgent("claude", claudeDiscussArgs, claudePrompt, "", *timeout)
 			if claudeErr != nil {
 				errorf("Claude failed (round %d): %v", round, claudeErr)
 				verdict = "ERROR"
 				break
 			}
 
-			kiroPrompt := buildDiscussPrompt("discuss-kiro.md", question, fileContext, prevClaudePosition, false)
-			kiroArgs := []string{"chat", "--no-interactive", "--trust-tools=read,grep,glob,code"}
-			if *agent != "" {
-				kiroArgs = append(kiroArgs, "--agent", *agent)
-			}
-			var kiroErr error
-			kiroPosition, kiroErr = runAgent("kiro-cli", kiroArgs, kiroPrompt, *timeout)
-			if kiroErr != nil {
-				errorf("Kiro failed (round %d): %v", round, kiroErr)
+			codexPrompt := buildDiscussPrompt(codexTemplate, question, fileContext, prevClaudePosition, false)
+			var codexErr error
+			codexPosition, codexErr = runAgent("codex", codexDiscussArgs, codexPrompt, "", *timeout)
+			if codexErr != nil {
+				errorf("Codex failed (round %d): %v", round, codexErr)
 				verdict = "ERROR"
 				break
 			}
 
-			dlog.writeRound(round, claudePosition, kiroPosition)
+			dlog.writeRound(round, claudePosition, codexPosition)
 			info("  Claude: %s", parseDiscussVerdict(claudePosition))
-			info("  Kiro: %s", parseDiscussVerdict(kiroPosition))
+			info("  Codex: %s", parseDiscussVerdict(codexPosition))
 		}
 
 		// Check if both reached consensus
 		cv := parseDiscussVerdict(claudePosition)
-		kv := parseDiscussVerdict(kiroPosition)
+		kv := parseDiscussVerdict(codexPosition)
 		if cv == "CONSENSUS" && kv == "CONSENSUS" {
 			verdict = "CONSENSUS"
 			break
@@ -517,14 +535,14 @@ func newDiscussLog(dir, question, ctxPaths string, maxRounds int) *discussLog {
 	return &discussLog{path: path, f: f}
 }
 
-func (l *discussLog) writeRound(round int, claudeOutput, kiroOutput string) {
+func (l *discussLog) writeRound(round int, claudeOutput, codexOutput string) {
 	label := fmt.Sprintf("Round %d", round)
 	if round == 1 {
 		label = "Round 1 (blind)"
 	}
 	fmt.Fprintf(l.f, "\n---\n\n## %s\n\n", label)
 	fmt.Fprintf(l.f, "### Claude\n%s\n\n", strings.TrimSpace(claudeOutput))
-	fmt.Fprintf(l.f, "### Kiro\n%s\n", strings.TrimSpace(kiroOutput))
+	fmt.Fprintf(l.f, "### Codex\n%s\n", strings.TrimSpace(codexOutput))
 }
 
 func (l *discussLog) finish(verdict string, elapsed time.Duration) {
@@ -544,20 +562,68 @@ func (l *discussLog) finish(verdict string, elapsed time.Duration) {
 	}
 }
 
-func auditorArgs(prompt string) (string, []string, string) {
-	switch *auditor {
-	case "codex":
-		return "codex", []string{"exec", "-"}, prompt
-	default: // "claude"
-		return "claude", []string{"-p", "--model", *model}, prompt
+// claudeArgs invokes claude. With write=true it can read/write/edit source
+// files (driver role); otherwise it's restricted to read-only tools (critic
+// role) — no shell or network access either way.
+func claudeArgs(prompt string, write bool) (string, []string, string) {
+	if write {
+		return "claude", []string{
+			"-p", "--model", *model,
+			"--permission-mode", "acceptEdits",
+			"--allowedTools", "Read,Write,Edit,Grep,Glob",
+		}, prompt
 	}
+	return "claude", []string{"-p", "--model", *model, "--allowedTools", "Read,Grep,Glob"}, prompt
 }
 
-func runAgent(name string, args []string, stdinData string, t time.Duration) (string, error) {
+// codexArgs invokes codex. With write=true it runs with a writable sandbox
+// (driver role); otherwise it's sandboxed read-only (critic role).
+func codexArgs(prompt string, write bool) (string, []string, string) {
+	sandbox := "read-only"
+	if write {
+		sandbox = "workspace-write"
+	}
+	return "codex", []string{"exec", "--sandbox", sandbox, "-"}, prompt
+}
+
+// criticArgs/driverArgs resolve which binary fills which role based on
+// --swap. Default: codex critiques (read-only), claude drives (edits code).
+func criticArgs(prompt string) (string, []string, string) {
+	if *swap {
+		return claudeArgs(prompt, false)
+	}
+	return codexArgs(prompt, false)
+}
+
+func driverArgs(prompt string) (string, []string, string) {
+	if *swap {
+		return codexArgs(prompt, true)
+	}
+	return claudeArgs(prompt, true)
+}
+
+func criticName() string {
+	if *swap {
+		return "claude"
+	}
+	return "codex"
+}
+
+func driverName() string {
+	if *swap {
+		return "codex"
+	}
+	return "claude"
+}
+
+func runAgent(name string, args []string, stdinData, dir string, t time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), t)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	if stdinData != "" {
 		cmd.Stdin = strings.NewReader(stdinData)
 	}
@@ -621,7 +687,7 @@ func parseResponseTable(output string) string {
 		}
 	}
 	if len(table) == 0 {
-		errorf("could not extract response table; passing full Kiro output as prior context")
+		errorf("could not extract response table; passing full Claude output as prior context")
 		return output
 	}
 	return strings.Join(table, "\n")
@@ -753,13 +819,13 @@ func newReviewLog(dir, branch, base string, maxRounds int) *reviewLog {
 	return &reviewLog{path: path, f: f}
 }
 
-func (l *reviewLog) writeRoundAudit(round int, verdict, findings string) {
+func (l *reviewLog) writeRoundAudit(round int, agent, verdict, findings string) {
 	fmt.Fprintf(l.f, "\n---\n\n## Round %d\n\n", round)
-	fmt.Fprintf(l.f, "### Audit (Claude)\n**Verdict**: %s\n\n%s\n", verdict, findings)
+	fmt.Fprintf(l.f, "### Audit (%s)\n**Verdict**: %s\n\n%s\n", agent, verdict, findings)
 }
 
-func (l *reviewLog) writeRoundResponse(response string) {
-	fmt.Fprintf(l.f, "\n### Response (Kiro)\n%s\n", response)
+func (l *reviewLog) writeRoundResponse(agent, response string) {
+	fmt.Fprintf(l.f, "\n### Response (%s)\n%s\n", agent, response)
 }
 
 func (l *reviewLog) finish(rounds int, verdict string, elapsed time.Duration, stats string) {
@@ -913,16 +979,10 @@ func loadEnvDefaults() {
 	if v := os.Getenv("AUDIT_MODEL"); v != "" {
 		*model = v
 	}
-	if v := os.Getenv("AUDIT_AUDITOR"); v != "" {
-		*auditor = v
-	}
 	if v := os.Getenv("AUDIT_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			*timeout = d
 		}
-	}
-	if v := os.Getenv("AUDIT_AGENT"); v != "" {
-		*agent = v
 	}
 	if v := os.Getenv("AUDIT_THEME"); v != "" {
 		*theme = v
@@ -930,15 +990,29 @@ func loadEnvDefaults() {
 	if v := os.Getenv("AUDIT_LOG_DIR"); v != "" {
 		*logDir = v
 	}
+	if v := os.Getenv("AUDIT_SWAP"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			*swap = b
+		}
+	}
 }
 
 func preflightTools() error {
-	for _, cmd := range []string{*auditor, "kiro-cli"} {
+	for _, cmd := range []string{"codex", "claude"} {
 		if _, err := exec.LookPath(cmd); err != nil {
 			return fmt.Errorf("%s not found in PATH", cmd)
 		}
 	}
 	return nil
+}
+
+// warnCodexSandboxScope flags a real, unresolved limitation: codex's
+// --sandbox flag restricts writes and network, not read scope. Codex always
+// participates in both the review loop and discuss mode, so it can read any
+// file your OS user account can read — not just this repo. See README's
+// Security section for why this isn't containerized away.
+func warnCodexSandboxScope() {
+	warn("codex's sandbox restricts writes/network only — it can still read any file your OS user account can read, not just this repo. See README Security section.")
 }
 
 func preflight() error {
@@ -968,6 +1042,10 @@ func info(format string, args ...any) {
 
 func errorf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "\033[31m[audit-loop]\033[0m "+format+"\n", args...)
+}
+
+func warn(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "\033[33m[audit-loop]\033[0m "+format+"\n", args...)
 }
 
 func fatal(format string, args ...any) {
