@@ -174,7 +174,9 @@ func main() {
 		}
 		auditOutput, err := runAgent(criticBin, criticCmdArgs, stdinData, criticDir, criticEnv, *timeout)
 		if criticDir != "" {
-			os.RemoveAll(criticDir)
+			if rmErr := os.RemoveAll(criticDir); rmErr != nil {
+				errorf("could not remove critic temp dir %s (round %d): %v", criticDir, round, rmErr)
+			}
 		}
 		if err != nil {
 			errorf("%s failed (round %d): %v", criticName(), round, err)

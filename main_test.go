@@ -180,6 +180,61 @@ func TestModelResolution(t *testing.T) {
 			t.Errorf("opencode args = %v, must not contain --model when unset", args)
 		}
 	})
+
+	t.Run("opencode critic model needs provider/model", func(t *testing.T) {
+		resetFlags(t)
+		*critic = "opencode"
+		*criticMdl = "gpt-4"
+		if err := validateAgents(); err == nil || !strings.Contains(err.Error(), "provider/model") {
+			t.Errorf("validateAgents() = %v, want provider/model error", err)
+		}
+		*criticMdl = "anthropic/claude-sonnet-4-6"
+		if err := validateAgents(); err != nil {
+			t.Errorf("validateAgents() = %v, want nil", err)
+		}
+	})
+
+	t.Run("claude critic with empty model adds no --model", func(t *testing.T) {
+		resetFlags(t)
+		bin, args, _ := claudeArgs("P", false, "")
+		if bin != "claude" || containsString(args, "--model") {
+			t.Errorf("claudeArgs empty-model = %v, must not contain --model", args)
+		}
+		if !containsString(args, "--allowedTools") {
+			t.Errorf("claudeArgs empty-model = %v, want Read,Grep,Glob allowlist", args)
+		}
+	})
+}
+
+func TestLoadEnvDefaults(t *testing.T) {
+	t.Cleanup(func() { resetFlags(t) })
+
+	t.Setenv("AUDIT_CRITIC", "opencode")
+	t.Setenv("AUDIT_DRIVER", "codex")
+	t.Setenv("AUDIT_CRITIC_MODEL", "anthropic/claude-sonnet-4-6")
+	t.Setenv("AUDIT_DRIVER_MODEL", "claude-opus-4-6")
+	t.Setenv("AUDIT_MODEL", "claude-sonnet-4-5")
+	loadEnvDefaults()
+
+	if *critic != "opencode" {
+		t.Errorf("AUDIT_CRITIC: *critic = %q, want opencode", *critic)
+	}
+	if *driver != "codex" {
+		t.Errorf("AUDIT_DRIVER: *driver = %q, want codex", *driver)
+	}
+	if *criticMdl != "anthropic/claude-sonnet-4-6" {
+		t.Errorf("AUDIT_CRITIC_MODEL: *criticMdl = %q", *criticMdl)
+	}
+	if *driverMdl != "claude-opus-4-6" {
+		t.Errorf("AUDIT_DRIVER_MODEL: *driverMdl = %q", *driverMdl)
+	}
+	if *model != "claude-sonnet-4-5" {
+		t.Errorf("AUDIT_MODEL: *model = %q", *model)
+	}
+	// --driver-model wins over the --model alias
+	if got := resolvedDriverModel(); got != "claude-opus-4-6" {
+		t.Errorf("resolvedDriverModel() = %q, want claude-opus-4-6 (driver-model beats alias)", got)
+	}
 }
 
 func TestOpencodeArgs(t *testing.T) {
@@ -268,9 +323,8 @@ func TestCriticNeedsIsolation(t *testing.T) {
 }
 
 func TestDiscussArgs(t *testing.T) {
-	resetFlags(t)
-
 	t.Run("default grounded claude blind codex", func(t *testing.T) {
+		resetFlags(t)
 		bin, args, _, _ := discussArgs("claude", "grounded", "P")
 		if bin != "claude" || !containsString(args, "--allowedTools") {
 			t.Errorf("grounded claude args = %v, want Read,Grep,Glob", args)
@@ -282,6 +336,7 @@ func TestDiscussArgs(t *testing.T) {
 	})
 
 	t.Run("swap grounded codex blind claude", func(t *testing.T) {
+		resetFlags(t)
 		*swap = true
 		bin, args, _, _ := discussArgs("codex", "grounded", "P")
 		if bin != "codex" || !containsString(args, "read-only") {
@@ -294,6 +349,7 @@ func TestDiscussArgs(t *testing.T) {
 	})
 
 	t.Run("opencode blind text-only", func(t *testing.T) {
+		resetFlags(t)
 		bin, _, _, env := discussArgs("opencode", "blind", "P")
 		if bin != "opencode" {
 			t.Errorf("bin = %q", bin)
@@ -314,6 +370,8 @@ func TestDiscussArgs(t *testing.T) {
 	})
 
 	t.Run("opencode grounded read-only", func(t *testing.T) {
+		resetFlags(t)
+		*driver = "opencode"
 		bin, _, _, env := discussArgs("opencode", "grounded", "P")
 		if bin != "opencode" {
 			t.Errorf("bin = %q", bin)

@@ -291,7 +291,7 @@ The critic runs read-only; the driver gets write access. Which agent fills which
 |-------|--------------------|-----------------|
 | **claude** | `claude -p --allowedTools Read,Grep,Glob` — no write, no shell, no network. Real tool-level isolation | `claude -p --permission-mode acceptEdits --allowedTools Read,Write,Edit,Grep,Glob` — no shell, no network |
 | **codex** | `codex exec --sandbox read-only` in an empty temp dir — cannot write files or reach the network, but **can read anything your OS user can read** (see below) | `codex exec --sandbox workspace-write` — can write within the project workspace, no network |
-| **opencode** | `opencode run --pure --auto=false` from an empty temp dir with `OPENCODE_PERMISSION` denying everything except `read`/`glob`/`grep`, including `external_directory` — **real read-scoping** | `opencode run --pure --auto` with `read`/`edit`/`glob`/`grep` allowed and everything else (incl. `external_directory`) denied |
+| **opencode** | `opencode run --pure --log-level ERROR` from an empty temp dir with `OPENCODE_PERMISSION` denying everything except `read`/`glob`/`grep`, including `external_directory` — **real read-scoping** | `opencode run --pure --auto --log-level ERROR` with `read`/`edit`/`glob`/`grep` allowed and everything else (incl. `external_directory`) denied |
 
 ### Known limitation: Codex's sandbox doesn't scope reads
 
