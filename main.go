@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -18,18 +19,24 @@ import (
 //go:embed prompts/*.md
 var prompts embed.FS
 
+var validAgents = []string{"claude", "codex", "opencode"}
+
 var (
 	maxRounds = flag.Int("max-rounds", 5, "Max review rounds")
 	base      = flag.String("base", "main", "Base branch to diff against")
 	input     = flag.String("input", "", "File to review (uses file mode instead of diff mode)")
-	model     = flag.String("model", "claude-sonnet-4-6", "Claude model for the driver (addresser) role")
+	critic    = flag.String("critic", "codex", "Critic agent: claude, codex, or opencode")
+	driver    = flag.String("driver", "claude", "Driver agent: claude, codex, or opencode")
+	criticMdl = flag.String("critic-model", "", "Model for the critic agent (provider/model for opencode)")
+	driverMdl = flag.String("driver-model", "", "Model for the driver agent (provider/model for opencode)")
+	model     = flag.String("model", "", "Alias for --driver-model (kept for backwards compatibility)")
 	timeout   = flag.Duration("timeout", 5*time.Minute, "Timeout per agent invocation")
 	logDir    = flag.String("log-dir", ".audit/reviews", "Directory for review logs")
 	theme     = flag.String("theme", "", "Theme name or path (directory with auditor.md + addresser.md)")
 	dryRun    = flag.Bool("dry-run", false, "Show what would be reviewed, don't run")
 	full      = flag.Bool("full", false, "Review entire repo, not just branch diff")
 	ctxPaths  = flag.String("context", "", "Comma-separated file/dir paths for discuss context")
-	swap      = flag.Bool("swap", false, "Swap roles: codex drives (edits code), claude critiques (read-only)")
+	swap      = flag.Bool("swap", false, "Swap roles: the selected driver critiques, the selected critic drives")
 )
 
 func main() {
@@ -38,12 +45,18 @@ func main() {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		flag.Parse()
 		loadEnvDefaults()
+		if err := validateAgents(); err != nil {
+			fatal("%s", err)
+		}
 		runDiscuss()
 		return
 	}
 
 	flag.Parse()
 	loadEnvDefaults()
+	if err := validateAgents(); err != nil {
+		fatal("%s", err)
+	}
 
 	if *maxRounds <= 0 {
 		fatal("max-rounds must be >= 1, got %d", *maxRounds)
@@ -141,23 +154,25 @@ func main() {
 		}
 		auditPrompt := buildAuditorPrompt(themeDir, content, priorResponse, branch, round)
 
-		criticBin, criticCmdArgs, stdinData := criticArgs(auditPrompt)
+		criticBin, criticCmdArgs, stdinData, criticEnv := criticArgs(auditPrompt)
 		criticDir := ""
-		if criticName() == "codex" {
-			// Starting codex outside the repo blocks trivial relative-path
-			// reads (`cat ./secrets`) from a prompt-injected diff. It is NOT
-			// real isolation: --sandbox read-only restricts writes/network,
-			// not read scope, so absolute-path reads still reach anything
-			// the OS user account can read. See README's Security section.
+		if criticNeedsIsolation(criticBin) {
+			// Starting codex/opencode outside the repo blocks trivial
+			// relative-path reads (`cat ./secrets`) from a prompt-injected
+			// diff. For opencode this is real isolation: the critic's
+			// OPENCODE_PERMISSION config denies external_directory, so its
+			// read/glob/grep tools cannot escape the temp dir. For codex it
+			// is NOT real isolation (--sandbox read-only restricts writes
+			// and network, not read scope). See README's Security section.
 			td, tdErr := os.MkdirTemp("", "audit-critic-*")
 			if tdErr != nil {
-				errorf("could not create temp dir for codex critic (round %d): %v", round, tdErr)
+				errorf("could not create temp dir for %s critic (round %d): %v", criticBin, round, tdErr)
 				verdict = "ERROR"
 				break
 			}
 			criticDir = td
 		}
-		auditOutput, err := runAgent(criticBin, criticCmdArgs, stdinData, criticDir, *timeout)
+		auditOutput, err := runAgent(criticBin, criticCmdArgs, stdinData, criticDir, criticEnv, *timeout)
 		if criticDir != "" {
 			os.RemoveAll(criticDir)
 		}
@@ -189,8 +204,8 @@ func main() {
 		info("Sending findings to %s for resolution...", driverName())
 		addresserPrompt := buildAddresserPrompt(themeDir, findings, branch, round)
 
-		driverBin, driverCmdArgs, driverStdin := driverArgs(addresserPrompt)
-		driverOutput, err := runAgent(driverBin, driverCmdArgs, driverStdin, "", *timeout)
+		driverBin, driverCmdArgs, driverStdin, driverEnv := driverArgs(addresserPrompt)
+		driverOutput, err := runAgent(driverBin, driverCmdArgs, driverStdin, "", driverEnv, *timeout)
 		if err != nil {
 			detail := err.Error()
 			if driverOutput != "" {
@@ -245,16 +260,15 @@ func runDiscuss() {
 
 	fileContext := loadContext(*ctxPaths)
 
+	groundedName := driverName()
+	blindName := criticName()
+
 	if *dryRun {
-		grounded, blind := "claude", "codex"
-		if *swap {
-			grounded, blind = "codex", "claude"
-		}
 		info("Dry run — would discuss:")
 		info("  Question: %s", question)
 		info("  Context: %s", *ctxPaths)
 		info("  Max rounds: %d", *maxRounds)
-		info("  Grounded: %s / Blind: %s", grounded, blind)
+		info("  Grounded: %s / Blind: %s", groundedName, blindName)
 		os.Exit(0)
 	}
 
@@ -263,79 +277,74 @@ func runDiscuss() {
 	dlog := newDiscussLog(*logDir, question, *ctxPaths, *maxRounds)
 	start := time.Now()
 
-	var claudePosition, codexPosition string
+	var groundedPosition, blindPosition string
 	var verdict string
 
 	// One debater is grounded (read-only repo access), the other blind
-	// (text-only). Default: claude grounded, codex blind. --swap inverts
-	// which identity gets which prompt/tool access; codex has no true
-	// zero-tool mode, so its args stay a read-only sandbox either way.
-	claudeTemplate, codexTemplate := "discuss-grounded.md", "discuss-blind.md"
-	claudeDiscussArgs := []string{"-p", "--model", *model, "--allowedTools", "Read,Grep,Glob"}
-	if *swap {
-		claudeTemplate, codexTemplate = "discuss-blind.md", "discuss-grounded.md"
-		claudeDiscussArgs = []string{"-p", "--model", *model}
-	}
-	codexDiscussArgs := []string{"exec", "--sandbox", "read-only", "-"}
+	// (text-only). The grounded slot is filled by the selected driver agent,
+	// the blind slot by the selected critic agent. --swap inverts which agent
+	// gets which prompt/tool access; codex has no true zero-tool mode, so its
+	// blind args stay a read-only sandbox either way.
+	groundedTemplate, blindTemplate := "discuss-grounded.md", "discuss-blind.md"
 
 	for round := 1; round <= *maxRounds; round++ {
 		if round == 1 {
 			// Blind first round — both agents respond independently
 			info("Round 1/%d — blind positions...", *maxRounds)
 
-			claudePrompt := buildDiscussPrompt(claudeTemplate, question, fileContext, "", true)
-			codexPrompt := buildDiscussPrompt(codexTemplate, question, fileContext, "", true)
+			groundedPrompt := buildDiscussPrompt(groundedTemplate, question, fileContext, "", true)
+			blindPrompt := buildDiscussPrompt(blindTemplate, question, fileContext, "", true)
 
-			var claudeErr, codexErr error
-			claudePosition, claudeErr = runAgent("claude", claudeDiscussArgs, claudePrompt, "", *timeout)
-			if claudeErr != nil {
-				errorf("Claude failed: %v", claudeErr)
+			var groundedErr, blindErr error
+			groundedPosition, groundedErr = runDiscussAgent(groundedName, groundedPrompt, "grounded")
+			if groundedErr != nil {
+				errorf("%s failed: %v", groundedName, groundedErr)
 				verdict = "ERROR"
 				break
 			}
 
-			codexPosition, codexErr = runAgent("codex", codexDiscussArgs, codexPrompt, "", *timeout)
-			if codexErr != nil {
-				errorf("Codex failed: %v", codexErr)
+			blindPosition, blindErr = runDiscussAgent(blindName, blindPrompt, "blind")
+			if blindErr != nil {
+				errorf("%s failed: %v", blindName, blindErr)
 				verdict = "ERROR"
 				break
 			}
 
-			dlog.writeRound(round, claudePosition, codexPosition)
-			info("  Claude: %s", parseDiscussVerdict(claudePosition))
-			info("  Codex: %s", parseDiscussVerdict(codexPosition))
+			dlog.writeRound(round, groundedName, groundedPosition, blindName, blindPosition)
+			info("  %s: %s", groundedName, parseDiscussVerdict(groundedPosition))
+			info("  %s: %s", blindName, parseDiscussVerdict(blindPosition))
 		} else {
 			// Debate rounds — each sees the other's prior position
 			info("Round %d/%d — debate...", round, *maxRounds)
 
-			claudePrompt := buildDiscussPrompt(claudeTemplate, question, fileContext, codexPosition, false)
-			prevClaudePosition := claudePosition
-			var claudeErr error
-			claudePosition, claudeErr = runAgent("claude", claudeDiscussArgs, claudePrompt, "", *timeout)
-			if claudeErr != nil {
-				errorf("Claude failed (round %d): %v", round, claudeErr)
+			groundedPrompt := buildDiscussPrompt(groundedTemplate, question, fileContext, blindPosition, false)
+			prevGroundedPosition := groundedPosition
+			var groundedErr error
+			groundedPosition, groundedErr = runDiscussAgent(groundedName, groundedPrompt, "grounded")
+			if groundedErr != nil {
+				errorf("%s failed (round %d): %v", groundedName, round, groundedErr)
 				verdict = "ERROR"
 				break
 			}
 
-			codexPrompt := buildDiscussPrompt(codexTemplate, question, fileContext, prevClaudePosition, false)
-			var codexErr error
-			codexPosition, codexErr = runAgent("codex", codexDiscussArgs, codexPrompt, "", *timeout)
-			if codexErr != nil {
-				errorf("Codex failed (round %d): %v", round, codexErr)
+			blindPrompt := buildDiscussPrompt(blindTemplate, question, fileContext, prevGroundedPosition, false)
+			var blindErr error
+			blindPosition, blindErr = runDiscussAgent(blindName, blindPrompt, "blind")
+			if blindErr != nil {
+				errorf("%s failed (round %d): %v", blindName, round, blindErr)
 				verdict = "ERROR"
 				break
 			}
 
-			dlog.writeRound(round, claudePosition, codexPosition)
-			info("  Claude: %s", parseDiscussVerdict(claudePosition))
-			info("  Codex: %s", parseDiscussVerdict(codexPosition))
+			dlog.writeRound(round, groundedName, groundedPosition, blindName, blindPosition)
+			info("  %s: %s", groundedName, parseDiscussVerdict(groundedPosition))
+			info("  %s: %s", blindName, parseDiscussVerdict(blindPosition))
 		}
 
 		// Check if both reached consensus
-		cv := parseDiscussVerdict(claudePosition)
-		kv := parseDiscussVerdict(codexPosition)
-		if cv == "CONSENSUS" && kv == "CONSENSUS" {
+		gv := parseDiscussVerdict(groundedPosition)
+		bv := parseDiscussVerdict(blindPosition)
+		if gv == "CONSENSUS" && bv == "CONSENSUS" {
 			verdict = "CONSENSUS"
 			break
 		}
@@ -506,6 +515,22 @@ func parseDiscussVerdict(output string) string {
 	return m[1]
 }
 
+// runDiscussAgent runs one discuss debater with its role-specific args,
+// using a temp dir for isolation-capable agents (opencode) in the blind slot.
+func runDiscussAgent(name, prompt, role string) (string, error) {
+	bin, args, stdinData, env := discussArgs(name, role, prompt)
+	dir := ""
+	if role == "blind" && bin == "opencode" {
+		td, err := os.MkdirTemp("", "audit-blind-*")
+		if err != nil {
+			return "", fmt.Errorf("could not create temp dir for %s blind debater: %v", name, err)
+		}
+		defer os.RemoveAll(td)
+		dir = td
+	}
+	return runAgent(bin, args, stdinData, dir, env, *timeout)
+}
+
 // --- Discuss log writer ---
 
 type discussLog struct {
@@ -535,14 +560,14 @@ func newDiscussLog(dir, question, ctxPaths string, maxRounds int) *discussLog {
 	return &discussLog{path: path, f: f}
 }
 
-func (l *discussLog) writeRound(round int, claudeOutput, codexOutput string) {
+func (l *discussLog) writeRound(round int, groundedName, groundedOutput, blindName, blindOutput string) {
 	label := fmt.Sprintf("Round %d", round)
 	if round == 1 {
 		label = "Round 1 (blind)"
 	}
 	fmt.Fprintf(l.f, "\n---\n\n## %s\n\n", label)
-	fmt.Fprintf(l.f, "### Claude\n%s\n\n", strings.TrimSpace(claudeOutput))
-	fmt.Fprintf(l.f, "### Codex\n%s\n", strings.TrimSpace(codexOutput))
+	fmt.Fprintf(l.f, "### %s (grounded)\n%s\n\n", groundedName, strings.TrimSpace(groundedOutput))
+	fmt.Fprintf(l.f, "### %s (blind)\n%s\n", blindName, strings.TrimSpace(blindOutput))
 }
 
 func (l *discussLog) finish(verdict string, elapsed time.Duration) {
@@ -564,20 +589,24 @@ func (l *discussLog) finish(verdict string, elapsed time.Duration) {
 
 // claudeArgs invokes claude. With write=true it can read/write/edit source
 // files (driver role); otherwise it's restricted to read-only tools (critic
-// role) — no shell or network access either way.
-func claudeArgs(prompt string, write bool) (string, []string, string) {
-	if write {
-		return "claude", []string{
-			"-p", "--model", *model,
-			"--permission-mode", "acceptEdits",
-			"--allowedTools", "Read,Write,Edit,Grep,Glob",
-		}, prompt
+// role) — no shell or network access either way. mdl may be empty to use
+// claude's configured default.
+func claudeArgs(prompt string, write bool, mdl string) (string, []string, string) {
+	args := []string{"-p"}
+	if mdl != "" {
+		args = append(args, "--model", mdl)
 	}
-	return "claude", []string{"-p", "--model", *model, "--allowedTools", "Read,Grep,Glob"}, prompt
+	if write {
+		args = append(args, "--permission-mode", "acceptEdits", "--allowedTools", "Read,Write,Edit,Grep,Glob")
+	} else {
+		args = append(args, "--allowedTools", "Read,Grep,Glob")
+	}
+	return "claude", args, prompt
 }
 
 // codexArgs invokes codex. With write=true it runs with a writable sandbox
-// (driver role); otherwise it's sandboxed read-only (critic role).
+// (driver role); otherwise it's sandboxed read-only (critic role). Codex has
+// no model flag.
 func codexArgs(prompt string, write bool) (string, []string, string) {
 	sandbox := "read-only"
 	if write {
@@ -586,43 +615,165 @@ func codexArgs(prompt string, write bool) (string, []string, string) {
 	return "codex", []string{"exec", "--sandbox", sandbox, "-"}, prompt
 }
 
-// criticArgs/driverArgs resolve which binary fills which role based on
-// --swap. Default: codex critiques (read-only), claude drives (edits code).
-func criticArgs(prompt string) (string, []string, string) {
-	if *swap {
-		return claudeArgs(prompt, false)
+// opencodeArgs invokes opencode with permission isolation. The role selects
+// the OPENCODE_PERMISSION config; write enables --auto (driver). mdl must be
+// provider/model when set. A "*":"deny" catch-all denies everything that is
+// not explicitly allowed, which also gates MCP/custom tools from user config.
+func opencodeArgs(prompt string, write bool, mdl, role string) (string, []string, string, []string) {
+	args := []string{"run", "--pure", "--log-level", "ERROR"}
+	if mdl != "" {
+		if !strings.Contains(mdl, "/") {
+			fatal("opencode model %q must use provider/model format (e.g. anthropic/claude-sonnet-4-6)", mdl)
+		}
+		args = append(args, "--model", mdl)
 	}
-	return codexArgs(prompt, false)
+	if write {
+		args = append(args, "--auto")
+	}
+	env := []string{
+		"OPENCODE_PERMISSION=" + opencodePermissionJSON(role),
+		"OPENCODE_DISABLE_AUTOUPDATE=1",
+	}
+	return "opencode", args, prompt, env
 }
 
-func driverArgs(prompt string) (string, []string, string) {
-	if *swap {
-		return codexArgs(prompt, true)
+// opencodePermissionJSON returns an inline permissions config for a role.
+// Everything not explicitly allowed is denied (including MCP/custom tools).
+func opencodePermissionJSON(role string) string {
+	allowed := map[string]string{}
+	switch role {
+	case "critic", "grounded":
+		allowed = map[string]string{"read": "allow", "glob": "allow", "grep": "allow"}
+	case "driver":
+		allowed = map[string]string{"read": "allow", "edit": "allow", "glob": "allow", "grep": "allow"}
+	case "blind":
+		allowed = map[string]string{}
 	}
-	return claudeArgs(prompt, true)
+	perm := map[string]any{"*": "deny"}
+	for tool, action := range allowed {
+		perm[tool] = map[string]string{"*": action}
+	}
+	b, err := json.Marshal(perm)
+	if err != nil {
+		fatal("could not serialize opencode permission config: %v", err)
+	}
+	return string(b)
 }
 
+// criticName/driverName resolve which agent fills which role based on
+// --critic/--driver and --swap. Default: codex critiques (read-only), claude
+// drives (edits code). --swap inverts the two selected agents.
 func criticName() string {
 	if *swap {
-		return "claude"
+		return *driver
 	}
-	return "codex"
+	return *critic
 }
 
 func driverName() string {
 	if *swap {
-		return "codex"
+		return *critic
 	}
-	return "claude"
+	return *driver
 }
 
-func runAgent(name string, args []string, stdinData, dir string, t time.Duration) (string, error) {
+// resolvedDriverModel returns the effective driver model. --driver-model wins,
+// then the --model alias, then today's default when claude is the driver.
+func resolvedDriverModel() string {
+	if *driverMdl != "" {
+		return *driverMdl
+	}
+	if *model != "" {
+		return *model
+	}
+	if driverName() == "claude" {
+		return "claude-sonnet-4-6"
+	}
+	return ""
+}
+
+// resolvedCriticModel returns the effective critic model (empty = agent default).
+func resolvedCriticModel() string {
+	return *criticMdl
+}
+
+// criticArgs/driverArgs build the invocation for the current critic/driver.
+func criticArgs(prompt string) (string, []string, string, []string) {
+	switch criticName() {
+	case "claude":
+		bin, args, stdin := claudeArgs(prompt, false, resolvedCriticModel())
+		return bin, args, stdin, nil
+	case "codex":
+		bin, args, stdin := codexArgs(prompt, false)
+		return bin, args, stdin, nil
+	case "opencode":
+		return opencodeArgs(prompt, false, resolvedCriticModel(), "critic")
+	}
+	return "", nil, "", nil
+}
+
+func driverArgs(prompt string) (string, []string, string, []string) {
+	switch driverName() {
+	case "claude":
+		bin, args, stdin := claudeArgs(prompt, true, resolvedDriverModel())
+		return bin, args, stdin, nil
+	case "codex":
+		bin, args, stdin := codexArgs(prompt, true)
+		return bin, args, stdin, nil
+	case "opencode":
+		return opencodeArgs(prompt, true, resolvedDriverModel(), "driver")
+	}
+	return "", nil, "", nil
+}
+
+// discussArgs builds the invocation for a discuss slot. Grounded slots get
+// read-only repo access; blind slots are text-only (claude gets no tools,
+// opencode denies even read, codex stays in a read-only sandbox).
+func discussArgs(name, role, prompt string) (string, []string, string, []string) {
+	switch name {
+	case "claude":
+		args := []string{"-p"}
+		mdl := resolvedDriverModel()
+		if role == "blind" {
+			mdl = resolvedCriticModel()
+		}
+		if mdl != "" {
+			args = append(args, "--model", mdl)
+		}
+		if role == "grounded" {
+			args = append(args, "--allowedTools", "Read,Grep,Glob")
+		}
+		return "claude", args, prompt, nil
+	case "codex":
+		bin, args, stdin := codexArgs(prompt, false)
+		return bin, args, stdin, nil
+	case "opencode":
+		mdl := resolvedCriticModel()
+		if role == "grounded" {
+			mdl = resolvedDriverModel()
+		}
+		return opencodeArgs(prompt, false, mdl, role)
+	}
+	return "", nil, "", nil
+}
+
+// criticNeedsIsolation reports whether the critic must run from an empty temp
+// dir. Both codex and opencode do; claude's allowedTools allowlist already
+// scopes its reads to the repo.
+func criticNeedsIsolation(bin string) bool {
+	return bin == "codex" || bin == "opencode"
+}
+
+func runAgent(name string, args []string, stdinData, dir string, env []string, t time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), t)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
 	if dir != "" {
 		cmd.Dir = dir
+	}
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
 	}
 	if stdinData != "" {
 		cmd.Stdin = strings.NewReader(stdinData)
@@ -976,6 +1127,18 @@ func loadEnvDefaults() {
 	if v := os.Getenv("AUDIT_INPUT"); v != "" {
 		*input = v
 	}
+	if v := os.Getenv("AUDIT_CRITIC"); v != "" {
+		*critic = v
+	}
+	if v := os.Getenv("AUDIT_DRIVER"); v != "" {
+		*driver = v
+	}
+	if v := os.Getenv("AUDIT_CRITIC_MODEL"); v != "" {
+		*criticMdl = v
+	}
+	if v := os.Getenv("AUDIT_DRIVER_MODEL"); v != "" {
+		*driverMdl = v
+	}
 	if v := os.Getenv("AUDIT_MODEL"); v != "" {
 		*model = v
 	}
@@ -997,8 +1160,39 @@ func loadEnvDefaults() {
 	}
 }
 
+// validateAgents checks the selected agents are known and that opencode models
+// use the provider/model format. Runs at startup, before any loop begins.
+func validateAgents() error {
+	for _, a := range []string{*critic, *driver} {
+		if !contains(validAgents, a) {
+			return fmt.Errorf("unknown agent %q; valid agents: %s", a, strings.Join(validAgents, ", "))
+		}
+	}
+	if criticName() == "opencode" && resolvedCriticModel() != "" && !strings.Contains(resolvedCriticModel(), "/") {
+		return fmt.Errorf("critic model %q for opencode must use provider/model format (e.g. anthropic/claude-sonnet-4-6)", resolvedCriticModel())
+	}
+	if driverName() == "opencode" && resolvedDriverModel() != "" && !strings.Contains(resolvedDriverModel(), "/") {
+		return fmt.Errorf("driver model %q for opencode must use provider/model format (e.g. anthropic/claude-sonnet-4-6)", resolvedDriverModel())
+	}
+	return nil
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 func preflightTools() error {
-	for _, cmd := range []string{"codex", "claude"} {
+	seen := map[string]bool{}
+	for _, cmd := range []string{criticName(), driverName()} {
+		if seen[cmd] {
+			continue
+		}
+		seen[cmd] = true
 		if _, err := exec.LookPath(cmd); err != nil {
 			return fmt.Errorf("%s not found in PATH", cmd)
 		}
@@ -1006,12 +1200,14 @@ func preflightTools() error {
 	return nil
 }
 
-// warnCodexSandboxScope flags a real, unresolved limitation: codex's
-// --sandbox flag restricts writes and network, not read scope. Codex always
-// participates in both the review loop and discuss mode, so it can read any
-// file your OS user account can read — not just this repo. See README's
-// Security section for why this isn't containerized away.
+// warnCodexSandboxScope flags a real, unresolved limitation that applies only
+// when codex is a selected agent: codex's --sandbox flag restricts writes and
+// network, not read scope, so it can read any file the OS user account can
+// read — not just this repo. See README's Security section.
 func warnCodexSandboxScope() {
+	if !contains([]string{criticName(), driverName()}, "codex") {
+		return
+	}
 	warn("codex's sandbox restricts writes/network only — it can still read any file your OS user account can read, not just this repo. See README Security section.")
 }
 
